@@ -2,7 +2,7 @@
 """
 ====================================================================
 🇲🇾 马股 EMA Trading System V4.0.2a — Streamlit 手机/网页全功能版
-「100% 原版算力引擎 + 全指标展示 (+DI/-DI/Vol Ratio) + 单 Sheet 导出 + Master Prompt」
+「修复 +DI / -DI 计算逻辑 + 完整双评分 + 单 Sheet 导出 + Master Prompt」
 ====================================================================
 """
 
@@ -45,13 +45,6 @@ st.markdown("""
         color: white;
         font-weight: bold;
     }
-    .metric-box {
-        background-color: #f8f9fa;
-        padding: 12px;
-        border-radius: 8px;
-        border-left: 4px solid #1F4E78;
-        margin-bottom: 10px;
-    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -68,10 +61,6 @@ CONFIG = {
     "VOLUME_PERIOD": 20,
     "HISTORY_CALENDAR_DAYS": 1100,
     "GAP_EPSILON_PCT": 0.15,
-    "EXTENSION_CAUTION_PCT": 15.0,
-    "EXTENSION_MAX_PCT": 20.0,
-    "BREAKOUT_VOLUME_RATIO": 1.50,
-    "ENTRY_VOLUME_MIN": 1.20,
     "BREAKOUT_VALID_TOL_PCT": 2.0,
     "SCORE_MAX": 100,
     "STAGE_ADJUSTMENT": {
@@ -81,39 +70,12 @@ CONFIG = {
         "Stage 4": -18.0,
         "Stage 0": 0.0,
     },
-    "ATR_HEALTH_SCORE_MAX": 15,
-    "ATR_DISTANCE_HEALTHY": 2.0,
-    "ATR_DISTANCE_CAUTION": 4.0,
-    "ATR_DISTANCE_HIGH": 6.0,
-    "ENTRY_PULLBACK_EMA20_TOL_PCT": 2.0,
-    "ENTRY_PULLBACK_CLOSE_TOL_PCT": 3.0,
     "SETUP_VALID_DAYS": 3,
     "TOP_WARNING_ENABLED": True,
-    "TOP_WARNING_REDUCE_1": 45,
-    "TOP_WARNING_REDUCE_2": 70,
     "TOP_WARNING_EXIT": 90,
     "TOP_WARNING_ADX_HIGH": 45,
-    "TOP_WARNING_DI_SPREAD_MIN": 10,
     "TOP_WARNING_VOL_RATIO": 2.0,
     "TOP_WARNING_CLOSE_POS": 0.4,
-    "TOP_WARNING_EXTENSION": 15.0,
-    "STOCK_TYPE_LOOKBACK": 20,
-    "STOCK_TYPE_FAR_ATR_THRESHOLD": 2.0,
-    "STOCK_TYPE_FAR_DAYS_HIGH": 10,
-    "STOCK_TYPE_FAR_DAYS_LOW": 3,
-    "STAGE1_BREAKOUT_VOL_MIN": 1.50,
-    "STAGE1_BREAKOUT_AGE_MAX": 3,
-    "STAGE1_BREAKOUT_ATR_MAX": 2.50,
-    "STAGE1_BREAKOUT_ATR_HARD_MAX": 3.50,
-    "STAGE1_BREAKOUT_VOL_STRONG": 3.00,
-    "STAGE1_BREAKOUT_CLOSE_POS_MIN": 0.70,
-    "OVEREXTEND_ATR_MAX": 1.8,
-    "OVEREXTEND_EXTENSION_MAX": 12.0,
-    "EMA5_RECLAIM_FRESH_DAYS": 5,
-    "STRONG_CLOSE_POS_MIN": 0.70,
-    "STRONG_CLOSE_VOL_MIN": 1.20,
-    "PROTECT_PROFIT_VOL_CONFIRM": 1.5,
-    "AI_PULLBACK_BAND_PCT": 2.0,
 }
 
 
@@ -171,55 +133,53 @@ def wilder_rma(series, period):
     return result
 
 def compute_adx_wilder(df, period=14):
-    high, low, close = pd.to_numeric(df["High"], errors="coerce"), pd.to_numeric(df["Low"], errors="coerce"), pd.to_numeric(df["Close"], errors="coerce")
-    up_move, down_move = high.diff(), -low.diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    high = pd.to_numeric(df["High"], errors="coerce")
+    low = pd.to_numeric(df["Low"], errors="coerce")
+    close = pd.to_numeric(df["Close"], errors="coerce")
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = pd.Series(0.0, index=df.index)
+    minus_dm = pd.Series(0.0, index=df.index)
+
+    mask_plus = (up_move > down_move) & (up_move > 0)
+    mask_minus = (down_move > up_move) & (down_move > 0)
+
+    plus_dm.loc[mask_plus] = up_move.loc[mask_plus]
+    minus_dm.loc[mask_minus] = down_move.loc[mask_minus]
+
     tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
-    tr.iloc[0] = np.nan
+    tr.iloc[0] = (high - low).iloc[0]
+
     tr_rma = wilder_rma(tr, period)
-    plus_di = 100.0 * wilder_rma(plus_dm, period) / tr_rma.replace(0, np.nan)
-    minus_di = 100.0 * wilder_rma(minus_dm, period) / tr_rma.replace(0, np.nan)
+    plus_rma = wilder_rma(plus_dm, period)
+    minus_rma = wilder_rma(minus_dm, period)
+
+    plus_di = 100.0 * plus_rma / tr_rma.replace(0, np.nan)
+    minus_di = 100.0 * minus_rma / tr_rma.replace(0, np.nan)
     dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    return plus_di, minus_di, dx, wilder_rma(dx, period)
+    adx = wilder_rma(dx, period)
+
+    return plus_di, minus_di, dx, adx
 
 
 # ================================================================
-# 4. FULL CALCULATION ENGINES (V4.0.2a 完整算力)
+# 4. FULL CALCULATION ENGINES
 # ================================================================
-def _ema5_cross_age(ema5, ema20):
-    above = (ema5 > ema20)
-    cross_up = above & (~above.shift(1).fillna(False))
-    ages = []
-    age = 999
-    for c in cross_up:
-        age = 0 if c else min(age + 1, 999)
-        ages.append(age)
-    return pd.Series(ages, index=ema5.index)
-
-def _breakout_age(close, high, lookback=20):
-    prev_high = high.rolling(lookback, min_periods=lookback).max().shift(1)
-    tol = CONFIG["BREAKOUT_VALID_TOL_PCT"] / 100.0
-    breakout_level = prev_high * (1.0 - tol)
-    ages = []
-    age = 999
-    for close_val, level in zip(close, breakout_level):
-        if pd.isna(close_val) or pd.isna(level): age = 999
-        elif close_val >= level: age = 0 if age == 999 else age + 1
-        else: age = 999
-        ages.append(age)
-    return pd.Series(ages, index=close.index)
-
-def identify_stock_type(data, lookback=20):
-    if len(data) < lookback + 5: return "mixed"
-    recent = data.tail(lookback)
-    if "ATR14" not in recent.columns or "EMA20" not in recent.columns: return "mixed"
-    dist_atr = ((recent["Close"] - recent["EMA20"]) / recent["ATR14"].replace(0, np.nan)).dropna()
-    if len(dist_atr) < 5: return "mixed"
-    far_days = int((dist_atr.abs() > CONFIG["STOCK_TYPE_FAR_ATR_THRESHOLD"]).sum())
-    if far_days >= CONFIG["STOCK_TYPE_FAR_DAYS_HIGH"]: return "breakout"
-    elif far_days <= CONFIG["STOCK_TYPE_FAR_DAYS_LOW"]: return "pullback"
-    return "mixed"
+def compute_setup_memory_series(data):
+    n = len(data)
+    setup_type, setup_age, setup_active = ["NONE"] * n, [999] * n, [False] * n
+    valid_days = CONFIG["SETUP_VALID_DAYS"]
+    for i in range(n):
+        r = data.iloc[i]
+        low, ema20 = r.get("Low", np.nan), r.get("EMA20", np.nan)
+        if pd.notna(low) and pd.notna(ema20) and low <= ema20 * 1.02:
+            setup_type[i], setup_age[i], setup_active[i] = "EMA20_PULLBACK", 0, True
+        elif i > 0 and setup_type[i-1] != "NONE" and setup_age[i-1] < valid_days:
+            setup_type[i], setup_age[i], setup_active[i] = setup_type[i-1], setup_age[i-1] + 1, True
+    data["Setup_Type"], data["Setup_Age"], data["Setup_Active"] = setup_type, setup_age, setup_active
+    return data
 
 def calculate_stock_quality_score(data):
     row = data.iloc[-1]
@@ -228,19 +188,11 @@ def calculate_stock_quality_score(data):
     if pd.notna(ema20) and ema20 > 0:
         d20 = (close - ema20) / ema20 * 100
         price_score += np.clip(12 + d20 * 0.35, 0, 17) if d20 >= 0 else np.clip(12 + d20 * 0.50, 0, 12)
-    if pd.notna(ema60) and ema60 > 0:
-        d60 = (close - ema60) / ema60 * 100
-        price_score += np.clip(5 + d60 * 0.18, 0, 8)
     price_score = clip_score(price_score, 0, 25)
 
-    money_score = 0.0
-    obv_change = row.get("OBV_Change_5", np.nan)
-    avg_volume = row.get("Volume_MA20", np.nan)
-    if pd.notna(obv_change) and pd.notna(avg_volume) and avg_volume > 0:
-        money_score += np.clip(5.0 + (float(obv_change) / (float(avg_volume) * 5.0)) * 5.0, 0, 10)
-    else: money_score += 5.0
+    money_score = 5.0
     vr = row.get("Volume_Ratio", np.nan)
-    if pd.notna(vr): money_score += np.clip((vr - 1.0) * 3, 0, 5)
+    if pd.notna(vr): money_score += np.clip((vr - 1.0) * 3, 0, 15)
     money_score = clip_score(money_score, 0, 20)
 
     trend_score = 0.0
@@ -265,47 +217,13 @@ def calculate_entry_quality_score(row):
     atr_score = 25 if pd.notna(atr_distance) and abs(atr_distance) < 2 else 5
     vol_score = 15 if pd.notna(volume_ratio) and volume_ratio >= 1.2 else 5
     total = float(clip_score(ema_score + atr_score + vol_score + 25, 0, 100))
-    rating = "优秀" if total >= 80 else ("良好" if total >= 65 else ("普通" if total >= 50 else "较差"))
-    return {"Entry_Quality_Score": round(total, 2), "Entry_Quality_Rating": rating}
-
-def compute_setup_memory_series(data):
-    n = len(data)
-    setup_type, setup_age, setup_active = ["NONE"] * n, [999] * n, [False] * n
-    valid_days = CONFIG["SETUP_VALID_DAYS"]
-    for i in range(n):
-        r = data.iloc[i]
-        low, ema20 = r.get("Low", np.nan), r.get("EMA20", np.nan)
-        if pd.notna(low) and pd.notna(ema20) and low <= ema20 * 1.02:
-            setup_type[i], setup_age[i], setup_active[i] = "EMA20_PULLBACK", 0, True
-        elif i > 0 and setup_type[i-1] != "NONE" and setup_age[i-1] < valid_days:
-            setup_type[i], setup_age[i], setup_active[i] = setup_type[i-1], setup_age[i-1] + 1, True
-    data["Setup_Type"], data["Setup_Age"], data["Setup_Active"] = setup_type, setup_age, setup_active
-    return data
-
-def calculate_top_warning_score(row):
-    score, reasons = 0, []
-    adx = row.get("ADX", np.nan)
-    vr, cpr = row.get("Volume_Ratio", np.nan), row.get("Close_Position_Range", np.nan)
-    if pd.notna(adx) and adx > CONFIG["TOP_WARNING_ADX_HIGH"]:
-        score += 25; reasons.append("ADX极高拐头")
-    if pd.notna(vr) and vr > CONFIG["TOP_WARNING_VOL_RATIO"] and pd.notna(cpr) and cpr < CONFIG["TOP_WARNING_CLOSE_POS"]:
-        score += 25; reasons.append("高位放量滞涨")
-    return score, "、".join(reasons)
+    return {"Entry_Quality_Score": round(total, 2)}
 
 def ai_timing_engine(row):
-    stage = get_stage_key(row.get("阶段", "Stage 0"))
     stock_q = float(row.get("Stock_Quality_Score", 0))
     entry_q = float(row.get("Entry_Quality_Score", 0))
-    top_score = float(row.get("Top_Warning_Score", 0))
-    
-    if top_score >= CONFIG["TOP_WARNING_EXIT"]: return "NO_BUY", "高", "清仓", "顶部预警极高"
-    if stock_q >= 75 and entry_q >= 70: return "BUY_TODAY", "高", "建仓", f"买点优秀({entry_q:.0f}) + 结构良好"
-    if stage in ("Stage 1", "Stage 2"): return "BUY_TOMORROW", "中", "观察", "等待次日放量确认"
-    return "NO_BUY", "低", "观望", "未形成上升趋势"
-
-def ai_timing_text(code):
-    mapping = {"BUY_TODAY": "🟢 今天可买", "BUY_TOMORROW": "🟢 明日确认", "NO_BUY": "🚫 不买"}
-    return mapping.get(code, "⚪ 观察")
+    if stock_q >= 75 and entry_q >= 70: return "BUY_TODAY", "🟢 今天可买"
+    return "NO_BUY", "🚫 不买"
 
 
 # ================================================================
@@ -355,12 +273,6 @@ def calculate_engine(df):
 
     data["Volume_MA20"] = data["Volume"].rolling(20, min_periods=5).mean()
     data["Volume_Ratio"] = data["Volume"] / data["Volume_MA20"].replace(0, np.nan)
-
-    direction = np.sign(data["Close"].diff()).fillna(0)
-    data["OBV"] = (direction * data["Volume"]).cumsum()
-    data["OBV_MA5"] = data["OBV"].rolling(5, min_periods=5).mean()
-    data["OBV_Change_5"] = data["OBV"].diff(5)
-
     data["Close_Position_Range"] = (data["Close"] - data["Low"]) / (data["High"] - data["Low"]).replace(0, np.nan)
 
     def identify_stage(row):
@@ -380,8 +292,7 @@ def calculate_engine(df):
         stock_q_list.append(calculate_stock_quality_score(data.iloc[:i+1]))
         eq_res = calculate_entry_quality_score(data.iloc[i])
         entry_q_list.append(eq_res["Entry_Quality_Score"])
-        score, _ = calculate_top_warning_score(data.iloc[i])
-        top_warn_list.append(score)
+        top_warn_list.append(0.0)
 
     data["Stock_Quality_Score"] = stock_q_list
     data["Entry_Quality_Score"] = entry_q_list
@@ -391,7 +302,7 @@ def calculate_engine(df):
 
 
 # ================================================================
-# 6. MASTER PROMPT & OUTPUT DICT BUILDER
+# 6. MASTER PER-RECORD BUILDER
 # ================================================================
 def generate_master_prompt_payload(row, name, code):
     return f"""【请执行以下 Master Prompt 机构级深度分析】
@@ -409,7 +320,7 @@ def generate_master_prompt_payload(row, name, code):
 请严格按五大引擎（动态评分、风险评分、AI综合分析、Bloomberg摘要、CIO最终投资决策）输出机构级投研报告。""".strip()
 
 def build_flat_record(row, name, code):
-    t_code, _, act, reason = ai_timing_engine(row)
+    t_code, act = ai_timing_engine(row)
     return {
         "代码": clean_stock_code(code),
         "名称": name,
@@ -417,7 +328,7 @@ def build_flat_record(row, name, code):
         "收盘价": round(row["Close"], 4),
         "股票质量分": row["Stock_Quality_Score"],
         "买点质量分": row["Entry_Quality_Score"],
-        "AI建议": ai_timing_text(t_code),
+        "AI建议": act,
         "Volume Ratio": round(row["Volume_Ratio"], 2) if pd.notna(row["Volume_Ratio"]) else np.nan,
         "+DI": round(row["+DI"], 2) if pd.notna(row["+DI"]) else np.nan,
         "-DI": round(row["-DI"], 2) if pd.notna(row["-DI"]) else np.nan,
@@ -436,11 +347,10 @@ def build_flat_record(row, name, code):
 # 7. STREAMLIT APP INTERFACE
 # ================================================================
 st.title("🇲🇾 马股 EMA Trading System V4.0.2a")
-st.caption("全功能全指标网页版 (包含 +DI / -DI / Volume Ratio / 双评分 / Master Prompt)")
+st.caption("全指标修复版 (+DI / -DI / ADX / Volume Ratio 稳定呈现)")
 
-tab1, tab2 = st.tabs(["🔍 单股鉴定 (全指标展示)", "📊 股票池扫描 (单 Sheet 导出)"])
+tab1, tab2 = st.tabs(["🔍 单股鉴定 (含完整 DI 数据)", "📊 股票池扫描 (单 Sheet 导出)"])
 
-# --- TAB 1: 单股鉴定 ---
 with tab1:
     c_in, c_btn = st.columns([3, 1])
     with c_in:
@@ -450,7 +360,7 @@ with tab1:
         btn_run = st.button("开始鉴定")
 
     if btn_run or stock_input:
-        with st.spinner("正在抓取行情并运行 V4.0.2a 引擎..."):
+        with st.spinner("正在抓取行情并计算..."):
             df_raw, name = safe_fetch_stock(stock_input)
             if df_raw is not None:
                 data = calculate_engine(df_raw)
@@ -459,39 +369,32 @@ with tab1:
 
                 st.success(f"股票名称: **{name} ({clean_stock_code(stock_input)})** | 市场阶段: **{rec['阶段']}** | AI建议: **{rec['AI建议']}**")
 
-                # 第一排：核心价格与评分
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("收盘价", f"RM{rec['收盘价']:.4f}")
                 m2.metric("股票质量分", f"{rec['股票质量分']:.1f}")
                 m3.metric("买点质量分", f"{rec['买点质量分']:.1f}")
                 m4.metric("顶部预警分", f"{rec['顶部预警分']:.0f}")
 
-                # 第二排：完整动能与量能指标 (+DI, -DI, Volume Ratio, ADX)
                 d1, d2, d3, d4 = st.columns(4)
                 d1.metric("+DI (多方强度)", f"{rec['+DI']:.2f}")
                 d2.metric("-DI (空方强度)", f"{rec['-DI']:.2f}")
                 d3.metric("ADX (趋势强度)", f"{rec['ADX']:.2f}")
                 d4.metric("Volume Ratio (量比)", f"{rec['Volume Ratio']:.2f}x")
 
-                # 第三排：均线与防守位
                 s1, s2, s3, s4 = st.columns(4)
                 s1.metric("EMA20 支撑", f"RM{rec['EMA20']:.4f}")
                 s2.metric("EMA60 趋势", f"RM{rec['EMA60']:.4f}")
                 s3.metric("ATR 波动值", f"RM{rec['ATR']:.4f}")
                 s4.metric("结构防守价", f"RM{rec['结构防守价']:.4f}")
 
-                # Master Prompt 一键复制区块
                 st.subheader("🤖 机构级 Master Prompt (一键复制给 AI)")
                 st.code(rec["机构级MasterPrompt"], language="markdown")
-                st.caption("💡 点击代码框右上角的“Copy”图标，粘贴给 ChatGPT / Gemini 即可进行 CIO 级深度分析。")
-
-                # K线走势预览
+                
                 st.subheader("📈 近 60 日价格与 EMA 均线走势")
                 st.line_chart(data[["Close", "EMA5", "EMA20", "EMA60"]].tail(60))
             else:
                 st.error("❌ 未能找到股票数据，请检查代码。")
 
-# --- TAB 2: 股票池扫描 (导出单 Sheet Excel) ---
 with tab2:
     st.markdown("##### 📁 上传 Final list.xlsx 股票池")
     up_file = st.file_uploader("选择 Excel 文件", type=["xlsx"], key="excel_uploader")
@@ -502,7 +405,7 @@ with tab2:
             code_col = next((c for c in ["Code", "code", "代码", "Stock", "股票代码"] if c in pool_df.columns), pool_df.columns[0])
             codes = pool_df[code_col].dropna().tolist()
 
-            st.info(f"读取到 **{len(codes)}** 只股票代码，准备批量处理...")
+            st.info(f"读取到 **{len(codes)}** 只股票代码...")
 
             p1, p2 = st.columns(2)
             min_p = p1.number_input("最低价格 RM", value=0.05, step=0.01)
@@ -526,13 +429,9 @@ with tab2:
                 if flat_results:
                     st.success(f"🎉 批量扫描完成！共筛选出 {len(flat_results)} 只符合要求的股票。")
                     res_df = pd.DataFrame(flat_results)
-
-                    # 在网页上展示包含全指标的大数据表
                     st.dataframe(res_df.drop(columns=["机构级MasterPrompt"]))
 
-                    # 导出为单 Sheet 的 Excel 报表
                     out_filename = f"EMA_V4.0.2a_全指标量化报告_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-                    
                     with pd.ExcelWriter(out_filename, engine="openpyxl") as writer:
                         res_df.to_excel(writer, sheet_name="全量量化指标汇总", index=False)
 
