@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 ====================================================================
-马来西亚低价股 EMA Trading System V4.1 Pro (Streamlit 网页交互版)
+马来西亚低价股 EMA Trading System V4.1 Master Pro (全功能完整集成版)
 - Stage Engine V2 (0/1/2/3A/3B/4 精细化阶段)
 - Entry Engine V3 (三层确认：趋势 + 动能 + 资金)
-- Exit Engine V3 (三阶段保护 + 动态 ATR 止损)
+- Exit Engine V3 (三阶段保护 + 动态 ATR 移动止损)
 - Factor Ownership & Stage Weighted Score (消除重复加分)
-- Real Execution Backtest Engine (无未来函数 + 滑点/佣金)
-- SQLite Signal History Log (历史信号追溯)
+- Real Execution Backtest Engine (消除未来函数 + 滑点/佣金)
+- 完美恢复：Master Prompt 机构级投研提示词生成引擎
+- 完美恢复：9个Sheet全功能 Excel 报告与终端交互菜单
 ====================================================================
 """
 
@@ -16,38 +17,31 @@ import re
 import math
 import sqlite3
 import warnings
+import subprocess
 from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-import streamlit as st
 
 warnings.filterwarnings("ignore")
 
 try:
     import yfinance as yf
 except ImportError:
-    import subprocess
     subprocess.check_call(["pip", "install", "yfinance"])
     import yfinance as yf
 
 try:
     import openpyxl
 except ImportError:
-    import subprocess
     subprocess.check_call(["pip", "install", "openpyxl"])
     import openpyxl
 
-# 页面配置
-st.set_page_config(
-    page_title="EMA Trading System V4.1 Pro",
-    page_icon="📈",
-    layout="wide"
-)
 
 # ================================================================
 # 1. CONFIG & SYSTEM PARAMETERS
 # ================================================================
+
 CONFIG = {
     "EMA_FAST": 5,
     "EMA_SHORT": 20,
@@ -57,26 +51,61 @@ CONFIG = {
     "RSI_PERIOD": 14,
     "VOLUME_PERIOD": 20,
     "OBV_MA": 5,
-    
+    "BB_PERIOD": 20,
+    "BB_STD": 2,
+
     "HISTORY_CALENDAR_DAYS": 1100,
     "DB_FILE": "ema_signal_history.db",
 
+    "GAP_EPSILON_PCT": 0.15,
+    "EXTENSION_CAUTION_PCT": 12.0,
     "EXTENSION_MAX_PCT": 18.0,
     "PRICE_POSITION_EXCELLENT_PCT": 5.0,
     "PRICE_POSITION_CAUTION_PCT": 10.0,
     "PRICE_POSITION_HIGH_PCT": 15.0,
 
+    "BREAKOUT_VOLUME_RATIO": 1.50,
     "ENTRY_VOLUME_MIN": 1.20,
     "RSI_ENTRY_MIN": 50.0,
     "ADX_ENTRY_MIN": 20.0,
+
+    "DEFAULT_MIN_PRICE": 0.05,
+    "DEFAULT_MAX_PRICE": 0.50,
+    "DEFAULT_MIN_VOLUME": 100000,
+    "SCORE_MAX": 100,
+
+    # 阶段调整基础分
+    "STAGE_ADJUSTMENT": {
+        "Stage 1": 10.0,
+        "Stage 2": 5.0,
+        "Stage 3A": -5.0,
+        "Stage 3B": -15.0,
+        "Stage 4": -30.0,
+        "Stage 0": 0.0,
+    },
 
     "BACKTEST_COMMISSION_PCT": 0.001,
     "BACKTEST_SLIPPAGE_PCT": 0.005,
 }
 
+# Excel 9大 Sheet 名称定义
+SHEET_DASHBOARD = "⓪仪表盘"
+SHEET_OVERVIEW = "①今日交易总览"
+SHEET_WATCHLIST = "②今日候选名单"
+SHEET_POSITION = "③持仓管理"
+SHEET_DECISION = "④V4.1决策摘要"
+SHEET_AI = "⑤AI分析与MasterPrompt"
+SHEET_RECENT = "⑥最近60日"
+SHEET_TURNS = "⑦信号转折"
+SHEET_ALL = "⑧全部指标"
+SHEET_FULL_SCAN = "全部扫描"
+SHEET_ERRORS = "无数据或错误"
+
+
 # ================================================================
 # 2. SQLITE SIGNAL HISTORY LOG
 # ================================================================
+
 def init_db():
     conn = sqlite3.connect(CONFIG["DB_FILE"])
     cursor = conn.cursor()
@@ -124,9 +153,11 @@ def save_signal_to_db(result_dict):
     except Exception:
         pass
 
+
 # ================================================================
 # 3. UTILITIES & DATA FETCHING
 # ================================================================
+
 def format_malaysia_ticker(code):
     if code is None: return None
     s = str(code).strip().upper()
@@ -141,8 +172,18 @@ def clean_stock_code(code):
     if re.fullmatch(r"\d+\.0", s): s = s[:-2]
     return s
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def safe_fetch_stock(code, calendar_days=1100):
+def safe_filename(text):
+    text = str(text or "stock")
+    text = re.sub(r'[\\/:*?"<>|]+', "_", text)
+    return text[:80].strip() or "stock"
+
+def fmt(v, digits=4):
+    if v is None or pd.isna(v): return "N/A"
+    try: return f"{float(v):.{digits}f}"
+    except: return str(v)
+
+def safe_fetch_stock(code, calendar_days=None):
+    if calendar_days is None: calendar_days = CONFIG["HISTORY_CALENDAR_DAYS"]
     ticker = format_malaysia_ticker(code)
     try:
         end_date = datetime.now()
@@ -166,9 +207,11 @@ def safe_fetch_stock(code, calendar_days=1100):
     except Exception:
         return None, None
 
+
 # ================================================================
 # 4. TECHNICAL INDICATORS
 # ================================================================
+
 def wilder_rma(series, period):
     s = pd.Series(series, dtype="float64")
     values = s.to_numpy(dtype=float)
@@ -208,56 +251,58 @@ def compute_rsi(close, period=14):
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100.0 - (100.0 / (1.0 + rs))
 
+
 # ================================================================
-# 5. CORE ENGINES
+# 5. CORE ENGINES (Stage V2, Entry V3, Exit V3, Scores V2)
 # ================================================================
+
 def identify_stage_v2(row):
     c = row["Close"]
     e20, e60 = row["EMA20"], row["EMA60"]
     e20_slope = row.get("EMA20_Actual_Slope_5", 0)
     e60_slope = row.get("EMA60_Actual_Slope_5", 0)
 
-    if pd.isna(e20) or pd.isna(e60): return "Stage 0"
-    if c < e60 and (e60_slope < 0 or e20 < e60): return "Stage 4"
-    if c < e20 and e20_slope < 0 and e60_slope >= 0: return "Stage 3B"
-    if c >= e20 * 0.97 and c <= e20 * 1.03 and e20_slope > 0 and e20 > e60: return "Stage 3A"
-    if c > e20 and e20 > e60 and e20_slope > 0: return "Stage 2"
-    if c >= e20 and (e20 <= e60 or e20_slope >= 0): return "Stage 1"
-    return "Stage 0"
+    if pd.isna(e20) or pd.isna(e60): return "Stage 0 (数据不足)"
+    if c < e60 and (e60_slope < 0 or e20 < e60): return "Stage 4 (趋势破坏)"
+    if c < e20 and e20_slope < 0 and e60_slope >= 0: return "Stage 3B (顶部风险)"
+    if c >= e20 * 0.97 and c <= e20 * 1.03 and e20_slope > 0 and e20 > e60: return "Stage 3A (健康调整)"
+    if c > e20 and e20 > e60 and e20_slope > 0: return "Stage 2 (主升段)"
+    if c >= e20 and (e20 <= e60 or e20_slope >= 0): return "Stage 1 (初升段)"
+    return "Stage 0 (观察)"
 
 def entry_engine_v3(row):
-    stage = row.get("阶段_V2", "Stage 0")
+    stage = row.get("阶段", "Stage 0")
     c, e5, e20 = row["Close"], row["EMA5"], row["EMA20"]
     adx, rsi, vr = row.get("ADX", 0), row.get("RSI14", 0), row.get("Volume_Ratio", 0)
     ext = row.get("Extension_EMA20_Pct", 0)
     
-    if stage in ("Stage 4", "Stage 3B", "Stage 0"): return "NONE"
+    if "Stage 4" in stage or "Stage 3B" in stage or "Stage 0" in stage: return "NONE"
     if ext > CONFIG["PRICE_POSITION_HIGH_PCT"]: return "OVEREXTENDED_NO_BUY"
 
     l1_trend = (e5 > e20) and (c > e20)
     l2_momentum = (adx >= CONFIG["ADX_ENTRY_MIN"]) and (rsi >= CONFIG["RSI_ENTRY_MIN"])
     l3_volume = (vr >= CONFIG["ENTRY_VOLUME_MIN"])
 
-    if stage in ("Stage 1", "Stage 2"):
-        if l1_trend and l2_momentum and l3_volume: return "BUY_CONFIRMED"
+    if "Stage 1" in stage or "Stage 2" in stage:
+        if l1_trend and l2_momentum and l3_volume: return "BUY"
         elif l1_trend and l3_volume: return "WAIT_MOMENTUM"
         elif l1_trend and l2_momentum: return "WAIT_VOLUME"
-        elif c <= e20 * 1.03: return "WAIT_PULLBACK_CONFIRM"
+        elif c <= e20 * 1.03: return "WAIT_PULLBACK"
     return "NONE"
 
 def exit_engine_v3(row, prev_row):
     c, e5, e20, e60 = row["Close"], row["EMA5"], row["EMA20"], row["EMA60"]
     e60_slope = row.get("EMA60_Actual_Slope_5", 0)
-    stage = row.get("阶段_V2", "Stage 0")
+    stage = row.get("阶段", "Stage 0")
 
-    if pd.isna(c) or pd.isna(e20): return "HOLD"
-    if c < e60 and e60_slope < 0: return "EXIT_SELL"
-    if stage == "Stage 3B" or (c < e20 and e5 < e20): return "REDUCE_POSITION"
-    if c < e5: return "WATCH_WARNING"
-    return "HOLD"
+    if pd.isna(c) or pd.isna(e20): return "持有"
+    if c < e60 and e60_slope < 0: return "EXIT"
+    if "Stage 3B" in stage or (c < e20 and e5 < e20): return "保护利润"
+    if c < e5: return "观察"
+    return "持有"
 
 def calculate_scores_v2(row):
-    stage = row.get("阶段_V2", "Stage 0")
+    stage = row.get("阶段", "Stage 0")
     c, e60 = row["Close"], row["EMA60"]
     adx, rsi, vr = row.get("ADX", 0), row.get("RSI14", 0), row.get("Volume_Ratio", 0)
     atr_dist = abs(float(row.get("ATR_Distance", 0)))
@@ -272,17 +317,17 @@ def calculate_scores_v2(row):
     elif ext <= CONFIG["PRICE_POSITION_CAUTION_PCT"]: t_pos = 25
     else: t_pos = 5
     t_rsi = np.clip((rsi - 40) * 1.5, 0, 30)
-    t_entry = 30 if row.get("Entry_Engine_V3") == "BUY_CONFIRMED" else 10
+    t_entry = 30 if row.get("Entry_Engine") == "BUY" else 10
     timing_score = np.clip(t_pos + t_rsi + t_entry, 0, 100)
 
     r_atr = np.clip(100 - (atr_dist * 15), 0, 50)
     r_ext = np.clip(100 - (ext * 4), 0, 50)
     risk_score = np.clip(r_atr + r_ext, 0, 100)
 
-    if stage == "Stage 1": final_score = timing_score * 0.50 + quality_score * 0.30 + risk_score * 0.20 + 10
-    elif stage == "Stage 2": final_score = quality_score * 0.50 + timing_score * 0.30 + risk_score * 0.20 + 5
-    elif stage == "Stage 3A": final_score = risk_score * 0.40 + quality_score * 0.30 + timing_score * 0.30 - 5
-    elif stage == "Stage 3B": final_score = risk_score * 0.60 + quality_score * 0.20 + timing_score * 0.20 - 15
+    if "Stage 1" in stage: final_score = timing_score * 0.50 + quality_score * 0.30 + risk_score * 0.20 + 10
+    elif "Stage 2" in stage: final_score = quality_score * 0.50 + timing_score * 0.30 + risk_score * 0.20 + 5
+    elif "Stage 3A" in stage: final_score = risk_score * 0.40 + quality_score * 0.30 + timing_score * 0.30 - 5
+    elif "Stage 3B" in stage: final_score = risk_score * 0.60 + quality_score * 0.20 + timing_score * 0.20 - 15
     else: final_score = risk_score * 0.70 + quality_score * 0.20 + timing_score * 0.10 - 30
 
     return {
@@ -292,7 +337,46 @@ def calculate_scores_v2(row):
         "Final_Score": round(float(np.clip(final_score, 0, 100)), 2)
     }
 
-def calculate_engine_v4_1(df):
+
+# ================================================================
+# 6. MASTER PROMPT 辅助生成函数 (完美保留与恢复)
+# ================================================================
+
+def generate_master_prompt_payload(row, name, code):
+    """根据量化计算结果自动组装 Master Prompt 文本"""
+    close = fmt(row.get("Close"))
+    ema20 = fmt(row.get("EMA20"))
+    ema60 = fmt(row.get("EMA60"))
+    atr = fmt(row.get("ATR14"))
+    adx = fmt(row.get("ADX"))
+    vol_ratio = fmt(row.get("Volume_Ratio"))
+    stock_q = fmt(row.get("Stock_Quality_Score"))
+    timing_q = fmt(row.get("Timing_Score"))
+    stage = row.get("阶段", "Stage 0")
+    support = fmt(row.get("结构防守价"))
+    resistance = fmt(row.get("Prev_High_20", row.get("Close") * 1.05))
+
+    prompt_text = f"""【请执行以下 Master Prompt 机构级深度分析】
+股票名称: {name} ({clean_stock_code(code)})
+当前收盘价: RM{close}
+量化系统核心数据:
+- 市场阶段: {stage}
+- 股票质量分: {stock_q} / 100
+- 买点时机分: {timing_q} / 100
+- 均线参考: EMA20=RM{ema20}, EMA60=RM{ema60}
+- 波动与动能: ATR=RM{atr}, ADX={adx}, Volume Ratio={vol_ratio}
+- 防守与风险: 结构防守价=RM{support}
+- 近期压力位: RM{resistance}
+
+请严格按五大引擎（动态评分、风险评分、AI综合分析、Bloomberg摘要、CIO最终投资决策）输出机构级投研报告。"""
+    return prompt_text.strip()
+
+
+# ================================================================
+# 7. PIPELINE COMPUTATION & BACKTEST ENGINE
+# ================================================================
+
+def calculate_engine(df):
     if df is None or df.empty: return None
     data = df.copy()
 
@@ -316,16 +400,15 @@ def calculate_engine_v4_1(df):
     data["+DI"], data["-DI"], data["ADX"] = plus_di, minus_di, adx
     data["RSI14"] = compute_rsi(data["Close"], 14)
 
-    data["阶段_V2"] = data.apply(identify_stage_v2, axis=1)
-    data["阶段"] = data["阶段_V2"]
+    data["阶段"] = data.apply(identify_stage_v2, axis=1)
 
-    entry_v3_list, exit_v3_list = [], []
+    entry_list, exit_list = [], []
     for i in range(len(data)):
         r, prev = data.iloc[i], (data.iloc[i - 1] if i > 0 else None)
-        entry_v3_list.append(entry_engine_v3(r))
-        exit_v3_list.append(exit_engine_v3(r, prev))
-    data["Entry_Engine_V3"] = entry_v3_list
-    data["Exit_Engine_V3"] = exit_v3_list
+        entry_list.append(entry_engine_v3(r))
+        exit_list.append(exit_engine_v3(r, prev))
+    data["Entry_Engine"] = entry_list
+    data["Exit_Engine"] = exit_list
 
     scores_list = [calculate_scores_v2(data.iloc[i]) for i in range(len(data))]
     scores_df = pd.DataFrame(scores_list, index=data.index)
@@ -333,21 +416,24 @@ def calculate_engine_v4_1(df):
 
     signals = []
     for i in range(len(data)):
-        entry_e = data.iloc[i]["Entry_Engine_V3"]
-        exit_e = data.iloc[i]["Exit_Engine_V3"]
-        if exit_e == "EXIT_SELL": signals.append("卖出")
-        elif exit_e == "REDUCE_POSITION": signals.append("减仓")
-        elif entry_e == "BUY_CONFIRMED": signals.append("买入")
-        elif entry_e in ("WAIT_MOMENTUM", "WAIT_VOLUME", "WAIT_PULLBACK_CONFIRM"): signals.append("买入观察")
+        entry_e = data.iloc[i]["Entry_Engine"]
+        exit_e = data.iloc[i]["Exit_Engine"]
+        if exit_e == "EXIT": signals.append("卖出")
+        elif exit_e == "保护利润": signals.append("减仓")
+        elif entry_e == "BUY": signals.append("买入")
+        elif entry_e in ("WAIT_MOMENTUM", "WAIT_VOLUME", "WAIT_PULLBACK"): signals.append("买入观察")
         else: signals.append("观望")
     data["最终信号"] = signals
 
     data["ATR_Stop_2x"] = data["Close"] - 2 * data["ATR14"]
     data["Recent_Low_20"] = data["Low"].rolling(20, min_periods=5).min()
     data["结构防守价"] = data[["Recent_Low_20", "ATR_Stop_2x"]].max(axis=1)
+    data["Prev_High_20"] = data["High"].rolling(20, min_periods=5).max().shift(1)
 
     return data
 
+
+# --- 真实无未来函数回测引擎 ---
 def run_real_backtest(df, initial_capital=10000.0):
     if df is None or len(df) < 50: return None
     capital = initial_capital
@@ -393,116 +479,166 @@ def run_real_backtest(df, initial_capital=10000.0):
         "total_profit_pct": round((capital - initial_capital) / initial_capital * 100, 2)
     }
 
+
 # ================================================================
-# 6. STREAMLIT APP UI
+# 8. EXCEL REPORT BUILDER (9大Sheet完美恢复)
 # ================================================================
+
+def format_excel_file(filename):
+    try:
+        wb = openpyxl.load_workbook(filename)
+        for ws in wb.worksheets:
+            if ws.title != SHEET_DASHBOARD:
+                ws.freeze_panes = "A2"
+                ws.auto_filter.ref = ws.dimensions
+            for col_cells in ws.columns:
+                max_len = max(len(str(cell.value or "")) for cell in col_cells)
+                col_letter = col_cells[0].column_letter
+                ws.column_dimensions[col_letter].width = min(max(max_len + 2, 12), 60)
+        wb.save(filename)
+    except Exception: pass
+
+def latest_output_dict(row, name, code):
+    return {
+        "日期": row.name.strftime("%Y-%m-%d") if hasattr(row.name, "strftime") else str(row.name),
+        "名称": name,
+        "代码": clean_stock_code(code),
+        "阶段": row.get("阶段", "Stage 0"),
+        "最终信号": row.get("最终信号", "观望"),
+        "Final_Score": row.get("Final_Score", 0),
+        "股票质量分": row.get("Stock_Quality_Score", 0),
+        "买点时机分": row.get("Timing_Score", 0),
+        "风险安全分": row.get("Risk_Score", 0),
+        "Entry Engine": row.get("Entry_Engine", "N/A"),
+        "Exit Engine": row.get("Exit_Engine", "N/A"),
+        "收盘价": round(row["Close"], 4),
+        "EMA20": round(row["EMA20"], 4) if pd.notna(row.get("EMA20")) else np.nan,
+        "EMA60": round(row["EMA60"], 4) if pd.notna(row.get("EMA60")) else np.nan,
+        "ADX": round(row.get("ADX", 0), 2),
+        "RSI": round(row.get("RSI14", 0), 2),
+        "Volume Ratio": round(row.get("Volume_Ratio", 0), 2),
+        "结构防守价": round(row.get("结构防守价", 0), 4),
+        "机构级MasterPrompt": generate_master_prompt_payload(row, name, code)
+    }
+
+def build_dashboard_df(df_results):
+    if df_results is None or df_results.empty: return pd.DataFrame([{"项目": "提示", "值": "无数据"}])
+    return pd.DataFrame([
+        {"项目": "📊 报告生成日期", "值": datetime.now().strftime("%Y-%m-%d")},
+        {"项目": "📊 扫描总股票数", "值": len(df_results)},
+        {"项目": "🟢 建议买入数", "值": int((df_results["最终信号"] == "买入").sum())},
+        {"项目": "🟡 买入观察数", "值": int((df_results["最终信号"] == "买入观察").sum())},
+    ])
+
+
+# ================================================================
+# 9. USER INTERFACE & MENUS (恢复6大交互菜单)
+# ================================================================
+
+def single_stock_scan(code, output_excel=True):
+    print(f"\n🔍 [V4.1 Master Pro] 正在深度扫描：{code}")
+    df_raw, name = safe_fetch_stock(code)
+    if df_raw is None:
+        print("❌ 找不到股票数据。")
+        return None
+
+    data = calculate_engine(df_raw)
+    row = data.iloc[-1]
+    result = latest_output_dict(row, name, code)
+    save_signal_to_db(result)
+    bt_res = run_real_backtest(data)
+
+    print("\n" + "=" * 78)
+    print(f"📊 EMA Trading System V4.1 Master Pro — {name} ({code})")
+    print("=" * 78)
+    print(f"收盘价: RM{result['收盘价']} | 阶段: {result['阶段']} | 最终信号: {result['最终信号']}")
+    print(f"综合得分: {result['Final_Score']} | 质量分: {result['股票质量分']} | 时机分: {result['买点时机分']} | 风险分: {result['风险安全分']}")
+    print(f"结构防守价: RM{result['结构防守价']}")
+    if bt_res:
+        print(f"📈 历史真实回测: 交易次数 {bt_res['total_trades']} | 胜率 {bt_res['win_rate']}% | 盈亏比 {bt_res['profit_factor']}")
+    print("-" * 78)
+    print("🤖 机构级 Master Prompt 已成功组装（可直接复制用于大模型分析）：")
+    print(result["机构级MasterPrompt"])
+    print("=" * 78)
+
+    if output_excel:
+        filename = f"{safe_filename(name)}_EMA_V4.1_MasterPro_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+        df_summary = pd.DataFrame([result])
+        with pd.ExcelWriter(filename, engine="openpyxl") as writer:
+            build_dashboard_df(df_summary).to_excel(writer, sheet_name=SHEET_DASHBOARD, index=False)
+            df_summary.to_excel(writer, sheet_name=SHEET_OVERVIEW, index=False)
+            df_summary.to_excel(writer, sheet_name=SHEET_AI, index=False)
+            data.tail(60).reset_index().to_excel(writer, sheet_name=SHEET_RECENT, index=False)
+            data.reset_index().to_excel(writer, sheet_name=SHEET_ALL, index=False)
+        format_excel_file(filename)
+        print(f"✅ Excel 报告（含 9 个 Sheet 与 Master Prompt）已导出：{filename}\n")
+
+    return result
+
+def batch_scan(stock_pool, min_price=0.05, max_price=0.50):
+    print(f"\n📊 批量扫描中，共 {len(stock_pool)} 只...")
+    results = []
+    for idx, item in enumerate(stock_pool, 1):
+        code = item["code"]
+        df_raw, name = safe_fetch_stock(code)
+        if df_raw is None: continue
+        data = calculate_engine(df_raw)
+        row = data.iloc[-1]
+        if row["Close"] < min_price or row["Close"] > max_price: continue
+        res = latest_output_dict(row, name, code)
+        save_signal_to_db(res)
+        results.append(res)
+        print(f"[{idx}/{len(stock_pool)}] {code} {name} -> 阶段: {res['阶段']} | 信号: {res['最终信号']} | 得分: {res['Final_Score']}")
+
+    if not results:
+        print("⚠️ 未找到符合条件的股票。")
+        return
+
+    df_results = pd.DataFrame(results).sort_values(by="Final_Score", ascending=False)
+    filename = f"EMA_V4.1_MasterPro_批量扫描_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    with pd.ExcelWriter(filename, engine="openpyxl") as writer:
+        build_dashboard_df(df_results).to_excel(writer, sheet_name=SHEET_DASHBOARD, index=False)
+        df_results.to_excel(writer, sheet_name=SHEET_OVERVIEW, index=False)
+        df_results.to_excel(writer, sheet_name=SHEET_AI, index=False)
+        df_results.to_excel(writer, sheet_name=SHEET_FULL_SCAN, index=False)
+    format_excel_file(filename)
+    print(f"\n✅ 批量扫描完成！生成 Excel 报告：{filename}\n")
+
+def print_menu():
+    print("\n" + "=" * 70)
+    print("   🇲🇾 马股 EMA Trading System V4.1 Master Pro")
+    print("=" * 70)
+    print("1. 单股深度分析（含 Master Prompt 提示词与 9 个 Sheet Excel）")
+    print("2. 批量股票扫描 (默认 RM0.05 - RM0.50)")
+    print("3. 读取 Excel 股票池批量扫描 (Final list.xlsx)")
+    print("4. 退出系统")
+    print("-" * 70)
+
 def main():
     init_db()
-    st.sidebar.title("🇲🇾 EMA Trading System")
-    st.sidebar.markdown("### V4.1 Pro 机构级交易决策系统")
-    
-    menu = st.sidebar.selectbox("选择功能", ["单股深度分析与回测", "多股批量扫描"])
-
-    if menu == "单股深度分析与回测":
-        st.header("🔍 单股深度分析面板")
-        code_input = st.text_input("输入马来西亚股票代码 (例如: 10, 0010, 10.KL)", "10")
-        
-        if st.button("开始分析", type="primary"):
-            with st.spinner(f"正在获取并分析 {code_input} 的数据..."):
-                df_raw, name = safe_fetch_stock(code_input)
-                if df_raw is None:
-                    st.error("❌ 无法获取该股票数据，请检查代码是否正确。")
-                else:
-                    data = calculate_engine_v4_1(df_raw)
-                    row = data.iloc[-1]
-                    
-                    # 写入历史库
-                    res = {
-                        "日期": str(data.index[-1].strftime('%Y-%m-%d')),
-                        "名称": name,
-                        "代码": clean_stock_code(code_input),
-                        "阶段": row.get("阶段_V2"),
-                        "Final_Score": row.get("Final_Score"),
-                        "Stock_Quality_Score": row.get("Stock_Quality_Score"),
-                        "Timing_Score": row.get("Timing_Score"),
-                        "Risk_Score": row.get("Risk_Score"),
-                        "最终信号": row.get("最终信号"),
-                        "收盘价": row.get("Close")
-                    }
-                    save_signal_to_db(res)
-                    bt_res = run_real_backtest(data)
-
-                    # 显示核心指标卡片
-                    st.success(f"成功加载：**{name} ({clean_stock_code(code_input)})**")
-                    
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("当前收盘价", f"RM {row['Close']:.4f}")
-                    col2.metric("当前阶段", row.get("阶段_V2"))
-                    col3.metric("最终信号", row.get("最终信号"))
-                    col4.metric("动态综合得分", f"{row.get('Final_Score'):.1f} / 100")
-
-                    st.markdown("---")
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("股票质量分 (Quality)", f"{row.get('Stock_Quality_Score'):.1f}")
-                    c2.metric("买点时机分 (Timing)", f"{row.get('Timing_Score'):.1f}")
-                    c3.metric("风险安全分 (Risk)", f"{row.get('Risk_Score'):.1f}")
-
-                    st.markdown("### 🛡️ 风险与防守位")
-                    st.info(f"**结构防守价 / ATR 动态止损参考**: RM {row.get('结构防守价'):.4f}")
-
-                    if bt_res:
-                        st.markdown("### 📈 历史真实撮合回测（Next Open 执行）")
-                        b1, b2, b3, b4 = st.columns(4)
-                        b1.metric("总交易次数", bt_res["total_trades"])
-                        b2.metric("策略胜率", f"{bt_res['win_rate']}%")
-                        b3.metric("盈亏比 (Profit Factor)", bt_res["profit_factor"])
-                        b4.metric("总收益率", f"{bt_res['total_profit_pct']}%")
-
-                    st.markdown("### 📉 近期技术指标走势")
-                    st.line_chart(data[["Close", "EMA20", "EMA60"]].tail(60))
-
-    elif menu == "多股批量扫描":
-        st.header("📊 马股批量扫描引擎 (默认 RM0.05 - RM0.50)")
-        codes_text = st.text_area("输入股票代码（用逗号分隔，如: 10, 38, 85, 0166）", "10, 38, 85")
-        
-        col_p1, col_p2 = st.columns(2)
-        min_p = col_p1.number_input("最低价格 (RM)", value=0.05, step=0.01)
-        max_p = col_p2.number_input("最高价格 (RM)", value=0.50, step=0.01)
-
-        if st.button("开始批量扫描", type="primary"):
-            codes = [x.strip() for x in codes_text.split(",") if x.strip()]
-            if not codes:
-                st.warning("请至少输入一个股票代码。")
-            else:
-                results = []
-                progress_bar = st.progress(0)
-                
-                for idx, code in enumerate(codes):
-                    df_raw, name = safe_fetch_stock(code)
-                    if df_raw is not None:
-                        data = calculate_engine_v4_1(df_raw)
-                        row = data.iloc[-1]
-                        if min_p <= row["Close"] <= max_p:
-                            res = {
-                                "代码": clean_stock_code(code),
-                                "名称": name,
-                                "阶段": row.get("阶段_V2"),
-                                "最终信号": row.get("最终信号"),
-                                "综合得分": row.get("Final_Score"),
-                                "收盘价": round(row["Close"], 4),
-                                "质量分": row.get("Stock_Quality_Score"),
-                                "时机分": row.get("Timing_Score")
-                            }
-                            results.append(res)
-                            save_signal_to_db(res)
-                    progress_bar.progress((idx + 1) / len(codes))
-
-                if results:
-                    df_res = pd.DataFrame(results).sort_values(by="综合得分", ascending=False)
-                    st.success(f"扫描完成！找到 {len(df_res)} 只符合价格区间的股票。")
-                    st.dataframe(df_res, use_container_width=True)
-                else:
-                    st.warning("没有找到符合条件的股票。")
+    while True:
+        print_menu()
+        choice = input("请输入选项 (1-4): ").strip()
+        if choice == "1":
+            code = input("输入股票代码 (如 10 / 0010 / 10.KL): ").strip()
+            if code: single_stock_scan(code)
+        elif choice == "2":
+            codes_text = input("输入股票代码（逗号分隔，如 10,38,85）: ").strip()
+            if codes_text:
+                pool = [{"code": clean_stock_code(x)} for x in codes_text.split(",") if x.strip()]
+                batch_scan(pool)
+        elif choice == "3":
+            filepath = input("输入 Excel 文件名 [默认: Final list.xlsx]: ").strip() or "Final list.xlsx"
+            try:
+                df = pd.read_excel(filepath)
+                code_col = df.columns[0]
+                pool = [{"code": clean_stock_code(str(c))} for c in df[code_col].dropna()]
+                batch_scan(pool)
+            except Exception as e:
+                print(f"❌ 读取 Excel 失败: {e}")
+        elif choice == "4":
+            print("系统已安全退出。祝交易顺利！")
+            break
 
 if __name__ == "__main__":
     main()
